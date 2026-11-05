@@ -4,7 +4,7 @@ schemaVersion: "1.0"
 key: app.stokerhq.peacock
 kind: hook
 sdk:
-  version: "1.0.0"
-  sha256: "0484ed2b20eb47d4d33455ba84accae7eba1a9b39bda64da891eaf87aa0c4f0a"
+  version: "1.0.1"
+  sha256: "f53602e990ca59c348b99f6eb00e9b082f21a5b6b3aa766c521038fa59a69b6e"
 targets:
   - { os: windows, architecture: x64, source: hook-plugin/peacock.cpp, resources: hook-plugin/peacock.rc, name: peacock }

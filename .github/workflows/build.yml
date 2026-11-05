@@ -13,7 +13,7 @@ permissions:
 jobs:
   # peacock-windows-x64.dll, built by the SDK's reusable workflow against the SDK stoker-plugin.yaml pins.
   build:
-    uses: StokerHQ/plugin-sdk/.github/workflows/build-hook-plugin.yml@v1.0.0
+    uses: StokerHQ/plugin-sdk/.github/workflows/build-hook-plugin.yml@v1.0.1
 
   scanner:
     runs-on: windows-latest
