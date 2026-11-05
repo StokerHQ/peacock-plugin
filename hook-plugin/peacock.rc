@@ -1,0 +1,7 @@
+// The Stoker plugin for Peacock and the launcher's protocol it loads, carried inside peacock.dll: the
+// hook plugin writes both into Peacock's working folder at every start (peacock.cpp, WriteResource),
+// so the Peacock in the install is the release exactly as The Peacock Project publishes it. The ids
+// are peacock.cpp's PluginResource and AgentResource.
+
+101 RCDATA "..\\server\\stoker.plugin.js"
+102 RCDATA "..\\server\\stoker-agent.js"

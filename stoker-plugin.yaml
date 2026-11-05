@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://schemas.stokerhq.app/plugins/v1/plugin-project.schema.json
+# The Peacock hook plugin, built against the Stoker plugin SDK release pinned here (fetched by scripts/fetch-sdk.ps1).
+schemaVersion: "1.0"
+key: app.stokerhq.peacock
+kind: hook
+sdk:
+  version: "1.0.0"
+  sha256: "0484ed2b20eb47d4d33455ba84accae7eba1a9b39bda64da891eaf87aa0c4f0a"
+targets:
+  - { os: windows, architecture: x64, source: hook-plugin/peacock.cpp, resources: hook-plugin/peacock.rc, name: peacock }

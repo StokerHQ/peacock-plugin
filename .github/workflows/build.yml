@@ -1,0 +1,27 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  # peacock-windows-x64.dll, built by the SDK's reusable workflow against the SDK stoker-plugin.yaml pins.
+  build:
+    uses: StokerHQ/plugin-sdk/.github/workflows/build-hook-plugin.yml@v1.0.0
+
+  scanner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scanner tests
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          cmd /c "call `"$vs\VC\Auxiliary\Build\vcvarsall.bat`" x64 >nul && cl /nologo /utf-8 /std:c++20 /EHsc /W4 /WX /O2 hook-plugin\tests\scan.cpp /Fe:scan.exe && scan.exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
