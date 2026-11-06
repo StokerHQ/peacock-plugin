@@ -12,7 +12,11 @@ reaches the launcher. Then, as the game would:
   2. posts a contract's score to Peacock's leaderboard address and reads the board back - through
      the plugin's routes, and through Peacock's own LeaderboardEntries menu route, which proves the
      address was pointed at Stoker: the entry carries its score breakdown, under the Stoker name;
-  3. lets the "game" exit: Peacock writes the profile and exits by itself.
+     and the two pages the plugin answers itself: the board after a mission, with the difficulty the
+     game sends, and the Friends tab, from the launcher's friends range;
+  3. follows the presence the plugin sends as the game moves: the menu, the planning screen, a
+     mission (its first event), the debrief;
+  4. lets the "game" exit: Peacock writes the profile and exits by itself, and the presence is withdrawn.
 A second run without the launcher checks that Peacock's own leaderboards are left alone, and that an
 address an earlier run left in options.ini - with that run's port - is given back to Peacock.
 The game is a stand-in process (ping). No HITMAN is needed.
@@ -63,6 +67,12 @@ function Start-Peacock([string]$Data, [string]$Install, [int]$GamePid, [hashtabl
     }
     if (!$listening) { throw 'Peacock did not start listening.' }
     return @{ Process = $process; Output = $output }
+}
+
+function ConvertFrom-Jwt([string]$Token) {
+    $payload = ($Token -split '\.')[1].Replace('-', '+').Replace('_', '/')
+    $payload = $payload.PadRight([int]([Math]::Ceiling($payload.Length / 4) * 4), '=')
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
 }
 
 function New-Folders([string]$Root) {
@@ -122,6 +132,56 @@ try {
         $failures.Add("Peacock's own leaderboard route did not get the Stoker board: $($menu | ConvertTo-Json -Depth 4 -Compress)")
     }
 
+    $auth = @{ Authorization = "Bearer $($signIn.access_token)" }
+
+    # The board after the mission: the game sends difficultyLevel, which Peacock's own route does not read.
+    $debrief = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/profiles/page/DebriefingLeaderboards?contractid=$contract&difficultyLevel=2&page=0" -Headers $auth
+    if (@($debrief.data.Entries).Count -ne 1 -or @($debrief.data.Entries)[0].LeaderboardData.Score -ne 123456) {
+        $failures.Add("The mission's own leaderboard was not the normal board: $($debrief | ConvertTo-Json -Depth 4 -Compress)")
+    }
+
+    # The Friends tab, which Peacock does not serve: the launcher's friends range, the player's own entry among it.
+    $friends = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/profiles/page/FriendsLeaderboardEntries?contractid=$contract&difficultyLevel=2&page=0" -Headers $auth
+    if (@($friends.data.Entries).Count -ne 1 -or @($friends.data.Entries)[0].LeaderboardData.Score -ne 123456 -or !$friends.template) {
+        $failures.Add("The friends' leaderboard was not served from the launcher: $($friends | ConvertTo-Json -Depth 4 -Compress)")
+    }
+    $read = Get-Content $requests | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.op -eq 'leaderboard.entries' -and $_.body.range -eq 'friends' }
+    if (!$read) { $failures.Add('The Friends tab did not ask the launcher for the friends range.') }
+
+    # Presence, as the game moves: the menu, the planning screen, the mission (its first event), the debrief.
+    function Get-Statuses {
+        @(Get-Content $requests | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.op -eq 'presence.set' } | ForEach-Object { "$($_.body.status)" })
+    }
+    function Wait-Status([string]$Pattern) {
+        for ($i = 0; $i -lt 30; $i++) {
+            $last = @(Get-Statuses)[-1]
+            if ($last -match $Pattern) { return $last }
+            Start-Sleep -Milliseconds 100
+        }
+        return @(Get-Statuses)[-1]
+    }
+
+    $status = Wait-Status '^In Menu$'
+    if ($status -ne 'In Menu') { $failures.Add("The presence at start was '$status', not 'In Menu'.") }
+
+    try { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/profiles/page/Planning?contractid=$contract&resetescalation=false&forcecurrentcontract=false&errorhandling=false" -Headers $auth | Out-Null } catch { }
+    $status = Wait-Status '^Planning'
+    if ($status -notmatch '^Planning · .*Dubai$') { $failures.Add("The planning screen's presence was '$status'.") }
+
+    $profileId = (ConvertFrom-Jwt $signIn.access_token).unique_name
+    $sessionId = "$([DateTime]::UtcNow.Ticks)-$([Guid]::NewGuid())"
+    $events = @{ userId = $profileId; values = @(@{ Id = [Guid]::NewGuid().ToString(); Name = 'ContractStart'; UserId = $profileId; ContractId = $contract
+        ContractSessionId = $sessionId; Timestamp = 1; Value = @{}; Origin = 'gameclient'; Version = @{ _Major = 8; _Minor = 13; _Build = 0; _Revision = 0 } }) } | ConvertTo-Json -Depth 6
+    try { Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$Port/authentication/api/userchannel/EventsService/SaveEvents2" -Headers $auth -Body $events -ContentType 'application/json' | Out-Null }
+    catch { $failures.Add("Posting the mission's first event failed: $_") }
+    $status = Wait-Status 'Professional'
+    if ($status -notmatch 'Dubai · Professional$' -or $status -match '^Planning') { $failures.Add("The mission's presence was '$status'.") }
+
+    try { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/profiles/page/missionend?contractSessionId=$sessionId&masteryUnlockableId=" -Headers $auth | Out-Null } catch { }
+    $status = Wait-Status 'debrief'
+    if ($status -ne 'In Menu · Mission debrief') { $failures.Add("The debrief's presence was '$status'.") }
+    Write-Host "Presence sent: $((Get-Statuses) -join ' | ')"
+
     $sent = Get-Content $requests | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.op -eq 'leaderboard.upload' }
     if (@($sent).Count -ne 1 -or $sent.body.data.Score.StarCount -ne 5) { $failures.Add('The launcher was not handed the score with its breakdown.') }
     if (!(Get-Content $requests | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.op -eq 'session.hello' -and $_.body.integration.name -eq 'peacock' })) {
@@ -140,6 +200,10 @@ try {
         $expected = @('1659040', '1829590', '1829595')
         if (($entitlements -join ',') -ne ($expected -join ',')) { $failures.Add("Entitlements are '$($entitlements -join ',')', expected '$($expected -join ',')'.") }
     }
+
+    # Withdrawn as the game exited, so the launcher puts the game's own back and forgets this run's.
+    $last = @(Get-Content $requests | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.op -eq 'presence.set' })[-1]
+    if (!$last -or $last.body.status) { $failures.Add('The presence was not withdrawn when the game exited.') }
 
     $log = $run.Output.Result
     if ($log -notmatch 'Entitlements from Stoker: 2 DLC') { $failures.Add('The plugin did not answer the entitlement check.') }
@@ -181,4 +245,4 @@ if ($failures.Count) {
     if ($run) { Write-Host '--- Peacock output'; Write-Host $run.Output.Result }
     exit 1
 }
-Write-Host 'Peacock plugin: entitlements from stoker_dlc.txt, no Steam or IOI sign-in, leaderboards through the launcher with their breakdown (and Peacock''s own without it), profile written and server stopped with the game.' -ForegroundColor Green
+Write-Host 'Peacock plugin: entitlements from stoker_dlc.txt, no Steam or IOI sign-in, leaderboards through the launcher with their breakdown (and Peacock''s own without it), the mission''s and the friends'' boards, presence through menu, planning, mission and debrief, profile written and server stopped with the game.' -ForegroundColor Green

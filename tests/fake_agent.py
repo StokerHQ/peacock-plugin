@@ -164,7 +164,7 @@ def serve(conn):
                     reply = {"v": 1, "type": "response", "id": request["id"], "ok": False,
                              "error": {"code": refuse, "message": "refused by the test"}}
                 else:
-                    reply["body"] = {"protocol": 1, "session": "runtime-test", "capabilities": {"achievements": 2, "events": 1, "telemetry": 1, "controller": 1, "leaderboards": 2, "crash": 1},
+                    reply["body"] = {"protocol": 1, "session": "runtime-test", "capabilities": {"achievements": 2, "events": 1, "telemetry": 1, "controller": 1, "leaderboards": 2, "crash": 1, "presence": 1},
                                      "player": {"name": "Test Player", "steamId": "76561197960265729"}}
             elif request["op"] == "controller.get":
                 reply["body"] = CONTROLLER

@@ -30,7 +30,12 @@
 // feeds features that need IOI's servers, and with a Stoker ticket it can only fail.
 //
 // And it gives Peacock's leaderboards to Stoker: every Stoker player of the instance on one board per contract, through
-// the launcher's own protocol ("Leaderboards" below, stoker-agent.js).
+// the launcher's own protocol ("Leaderboards" below, stoker-agent.js), and tells Stoker what the player is doing - which
+// menu, which mission where, in which mode - better than the game's own Steam presence ("Presence" below).
+//
+// Peacock's menu routes are mounted behind its multiplayer menu router on the same path, so a route added there answers
+// first: that is how this plugin serves the two leaderboard pages Peacock gets wrong or lacks, and how it sees which
+// menu page the game opens.
 //
 // Peacock listens on loopback only when started by Stoker's hook plugin (HOST=127.0.0.1), so the
 // one client is the game on this machine, and its entitlements are this install's.
@@ -48,6 +53,11 @@ const { asyncGuard } = require("@peacockproject/core/databaseHandler")
 const { setFlag, getFlag, defaultFlags } = require("@peacockproject/core/flags")
 const { webFeaturesRouter } = require("@peacockproject/core/webFeatures")
 const { PEACOCKVERSTRING } = require("@peacockproject/core/utils")
+const { multiplayerMenuDataRouter } = require("@peacockproject/core/multiplayer/multiplayerMenuData")
+const { getLeaderboardEntries } = require("@peacockproject/core/contracts/leaderboards")
+const { getConfig } = require("@peacockproject/core/configSwizzleManager")
+const { fakePlayerRegistry } = require("@peacockproject/core/profileHandler")
+const { scenePathToRpAsset } = require("@peacockproject/core/discord/discordRp")
 
 // The launcher's protocol client, from beside this file, where the hook plugin writes both, by absolute path: this
 // plugin runs in a context whose require resolves a relative name against Peacock, not against this file. Peacock
@@ -145,6 +155,9 @@ function exitWithGame() {
 
         log(LogLevel.INFO, `The game (${pid}) has exited; writing profiles and stopping.`, "stoker")
         setTimeout(() => process.exit(0), FLUSH_LIMIT).unref()
+
+        // Withdrawn, so the launcher forgets this run's status rather than holding it for nobody.
+        presence?.set("")
 
         asyncGuard
             .forceFlush()
@@ -281,6 +294,96 @@ function serveLeaderboards() {
     })
 }
 
+/** A difficulty as the game sends it (1, 2, 4) under the name Peacock's boards use, as Peacock's own entries page names it. */
+function difficultyName(level) {
+    switch (Number.parseInt(level ?? "0", 10)) {
+        case 1:
+            return "casual"
+        case 2:
+            return "normal"
+        case 4:
+            return "master"
+        default:
+            return "unset"
+    }
+}
+
+/** A menu page's page number as Peacock reads one: 0 when absent. */
+function pageOf(value) {
+    return Math.max(0, Number.parseInt(value ?? "0", 10) || 0)
+}
+
+/**
+ * The board after a mission. Peacock's own route reads the difficulty from `difficulty`, but the game sends
+ * `difficultyLevel` - as it does to the menu's leaderboard, which Peacock reads right - so Peacock asks for the "unset"
+ * board, which holds nothing, and the board is empty until the player opens it again from the menu. Answered here as
+ * Peacock answers it, with the difficulty the game sent. Served whichever leaderboards Peacock uses: its own service
+ * keeps a board per difficulty too.
+ */
+function serveDebriefingLeaderboard() {
+    multiplayerMenuDataRouter.get("/DebriefingLeaderboards", async (req, res, next) => {
+        if (!req.query.contractid || req.query.difficulty !== undefined || req.query.difficultyLevel === undefined) {
+            next()
+            return
+        }
+
+        try {
+            const data = await getLeaderboardEntries(
+                req.query.contractid,
+                req.jwt.platform,
+                req.gameVersion,
+                req.query.difficultyLevel,
+                pageOf(req.query.page),
+            )
+            res.json({ template: getConfig("DebriefingLeaderboardsTemplate", false), data })
+        } catch (e) {
+            log(LogLevel.WARN, `The mission's leaderboard could not be read: ${e?.message ?? e}`, "stoker")
+            next()
+        }
+    })
+}
+
+/**
+ * The leaderboard's Friends tab, which Peacock does not serve at all: the same board, the player's Stoker friends and
+ * the player alone (the launcher's `friends` range, as a Steam game's friends board), in the shape of the global tab.
+ */
+function serveFriendsLeaderboard(controller) {
+    multiplayerMenuDataRouter.get("/FriendsLeaderboardEntries", async (req, res, next) => {
+        const contract = req.query.contractid ? controller.resolveContract(req.query.contractid, req.gameVersion) : undefined
+        if (!contract) {
+            next()
+            return
+        }
+
+        const data = { Entries: [], Contract: contract, Page: pageOf(req.query.page), HasMore: false, LeaderboardType: "singleplayer" }
+
+        try {
+            const name = boardName({
+                gameVersion: req.gameVersion,
+                contractId: req.query.contractid,
+                difficulty: difficultyName(req.query.difficultyLevel),
+            })
+            const id = await boardId(name, false)
+            if (id) {
+                const answer = await agent.request("leaderboard.entries", { id, range: "friends", start: 1, end: PAGE })
+                data.Entries = (answer.entries ?? []).map(entryOf).map((entry) => {
+                    // As Peacock does for the global tab: the templates take a player by its id in this registry.
+                    entry.LeaderboardData.Player = fakePlayerRegistry.index(
+                        entry.LeaderboardData.Player.displayName,
+                        req.jwt.platform,
+                        entry.platformId,
+                    )
+                    return entry
+                })
+            }
+        } catch (e) {
+            log(LogLevel.WARN, `The friends' leaderboard could not be read from the launcher: ${e?.message ?? e}`, "stoker")
+        }
+
+        res.json({ template: getConfig("LeaderboardEntriesTemplate", false), data })
+    })
+}
+
 /** How long start-up waits for the launcher's hello before leaving the leaderboards to Peacock. */
 const ADMISSION_TIMEOUT = 3000
 
@@ -297,25 +400,12 @@ function releaseLeaderboards() {
 }
 
 /**
- * Points Peacock's leaderboards at Stoker's, when the launcher admits this server as part of the game's run - which
- * only a launcher that started the game does. Otherwise the options are left as they are, and Peacock uses its own
- * service as it always does.
+ * Points Peacock's leaderboards at Stoker's, and serves the Friends tab from them. Otherwise the options are left as
+ * they are, and Peacock uses its own service as it always does.
  */
-async function useStokerLeaderboards() {
-    const candidate = new StokerAgent({
-        name: "peacock",
-        version: "1.0.0",
-        engine: { name: "peacock", version: String(PEACOCKVERSTRING) },
-    })
-
-    if (!StokerAgent.available() || !(await candidate.admitted(ADMISSION_TIMEOUT)) || candidate.capability("leaderboards") < 1) {
-        releaseLeaderboards()
-        log(LogLevel.INFO, "Not part of a game the Stoker launcher started; the leaderboards are Peacock's own.", "stoker")
-        return
-    }
-
-    agent = candidate
+function useStokerLeaderboards(controller) {
     serveLeaderboards()
+    serveFriendsLeaderboard(controller)
 
     const port = process.env.PORT || "80"
     setFlag("leaderboards", true)
@@ -323,7 +413,254 @@ async function useStokerLeaderboards() {
     log(LogLevel.INFO, "Leaderboards: every Stoker player's, through the launcher.", "stoker")
 }
 
-module.exports = async function stokerPlugin() {
+/**
+ * The launcher, once it admits this server as part of the game's run - which only a launcher that started the game
+ * does - or undefined.
+ */
+async function connectToLauncher() {
+    const candidate = new StokerAgent({
+        name: "peacock",
+        version: "1.1.0",
+        engine: { name: "peacock", version: String(PEACOCKVERSTRING) },
+    })
+
+    if (!StokerAgent.available() || !(await candidate.admitted(ADMISSION_TIMEOUT))) return undefined
+    return candidate
+}
+
+// ── Presence ─────────────────────────────────────────────────────────────────────────────
+//
+// What the player is doing, for their friends: the game's own Steam presence says "In Menu" and nothing else under
+// Peacock, while Peacock knows the menu page, the contract and how it is played. The launcher prefers this status over
+// the game's for the rest of the run (presence.set, integration-protocol.md), and puts the game's back when this one
+// is withdrawn at exit.
+//
+// Three things move it: the menu page the game opens (Hub, Planning, the mission's end), and any event of a contract
+// session - which is how a mission started from the planning screen and one loaded from a save both look.
+
+/** Parent locations by the start of their location id (LOCATION_<key>…), for a scene Peacock's table does not name. */
+const LOCATIONS = {
+    PARIS: "Paris",
+    COASTALTOWN: "Sapienza",
+    MARRAKECH: "Marrakesh",
+    BANGKOK: "Bangkok",
+    COLORADO: "Colorado",
+    HOKKAIDO: "Hokkaido",
+    NEWZEALAND: "Hawke's Bay",
+    MIAMI: "Miami",
+    COLOMBIA: "Santa Fortuna",
+    MUMBAI: "Mumbai",
+    NORTHAMERICA: "Whittleton Creek",
+    NORTHSEA: "Isle of Sgàil",
+    GREEDY: "New York",
+    OPULENT: "Haven Island",
+    GOLDEN: "Dubai",
+    ANCESTRAL: "Dartmoor",
+    EDGY: "Berlin",
+    WET: "Chongqing",
+    ELEGANT: "Mendoza",
+    TRAPPED: "Carpathian Mountains",
+    ROCKY: "Ambrose Island",
+    ICA_FACILITY: "ICA Facility",
+    AUSTRIA: "Himmelstein",
+    SALTY: "Hantu Port",
+    CAGED: "Siberia",
+}
+
+/** How a contract is played, by its type, as the game's menus name the modes. A main mission names none. */
+const MODES = {
+    elusive: "Elusive Target",
+    escalation: "Escalation",
+    arcade: "Arcade",
+    evergreen: "Freelancer",
+    sniper: "Sniper Assassin",
+    featured: "Contract",
+    usercreated: "Contract",
+    creation: "Contract Creation",
+    orbis: "Sarajevo Six",
+    vsrace: "Ghost Mode",
+    tutorial: "Training",
+}
+
+/** How long a mission's events after leaving it are taken as the game leaving it, in milliseconds. */
+const LATE_EVENTS = 10000
+
+/** The game's difficulty levels, as its menus name them. */
+const DIFFICULTIES = { 1: "Casual", 2: "Professional", 4: "Master" }
+
+/** A title a person can read: a contract's own words, never a localisation key (UI_CONTRACT_…), which only the game reads. */
+function readable(text) {
+    return typeof text === "string" && text.trim() !== "" && !/^[A-Z0-9_]+$/.test(text.trim()) ? text.trim() : undefined
+}
+
+function locationName(id) {
+    const key = String(id ?? "").replace(/^LOCATION_/, "").replace(/^PARENT_/, "")
+    const match = Object.keys(LOCATIONS)
+        .filter((name) => key === name || key.startsWith(`${name}_`))
+        .sort((a, b) => b.length - a.length)[0]
+    return match ? LOCATIONS[match] : undefined
+}
+
+/** An escalation level's number within its group, from the controller's level-to-contract mapping. */
+function escalationLevel(controller, metadata) {
+    const mapping = metadata.InGroup ? controller.escalationMappings?.get(metadata.InGroup) : undefined
+    const level = mapping ? Object.entries(mapping).find(([, id]) => id === metadata.Id)?.[0] : undefined
+    return level ? `Level ${level}` : undefined
+}
+
+/**
+ * The words for a contract: its mode, its name, and where. Peacock's own table for its Discord presence names a
+ * scene's mission and location (The Showstopper, Paris); a contract's own title is used where it is words.
+ */
+function describeContract(controller, contract, gameVersion) {
+    const metadata = contract?.Metadata ?? {}
+    const type = String(metadata.Type ?? "").toLowerCase()
+
+    let scene = []
+    try {
+        const asset = scenePathToRpAsset(String(metadata.ScenePath ?? ""), contract?.Data?.Bricks ?? [])
+        if (Array.isArray(asset)) scene = asset
+    } catch {
+        // Peacock's table is a convenience; the location table answers without it.
+    }
+
+    const location = scene[2] ?? locationName(metadata.Location)
+    const ownTitle = readable(metadata.Title)
+
+    switch (type) {
+        case "mission":
+        case "campaign":
+            return [ownTitle ?? scene[1], location]
+        case "elusive":
+        case "orbis":
+            return [MODES[type], scene[1] ?? ownTitle, location]
+        case "escalation": {
+            const group = metadata.InGroup ? controller.resolveContract(metadata.InGroup, gameVersion) : undefined
+            return [MODES.escalation, readable(group?.Metadata?.Title) ?? ownTitle, escalationLevel(controller, metadata), location]
+        }
+        case "arcade":
+            return [MODES.arcade, escalationLevel(controller, metadata), location]
+        default:
+            return [MODES[type], ownTitle, location]
+    }
+}
+
+/** The parts as one line: empty parts and a part that repeats the one before it left out. */
+function line(parts) {
+    const kept = []
+    for (const part of parts) {
+        if (part && part !== kept[kept.length - 1]) kept.push(part)
+    }
+    return kept.join(" · ")
+}
+
+class Presence {
+    constructor(controller, launcher) {
+        this.controller = controller
+        this.launcher = launcher
+        this.sent = undefined
+        this.missionSession = undefined
+    }
+
+    /** Sends a status unless it is the one sent last. An empty status withdraws it. Best effort: never awaited. */
+    set(status) {
+        if (status === this.sent) return
+        this.sent = status
+        log(LogLevel.INFO, status ? `Presence: ${status}` : "Presence withdrawn.", "stoker")
+        this.launcher
+            .request("presence.set", status ? { status } : {})
+            .catch((e) => log(LogLevel.DEBUG, `The presence could not be handed to the launcher: ${e?.message ?? e}`, "stoker"))
+    }
+
+    /**
+     * Leaves the mission being played. Its session's events the game sends as it leaves - for a few seconds - do not
+     * bring it back; a save of it loaded later, which carries the same session, does.
+     */
+    leave() {
+        if (this.missionSession) {
+            this.left = this.missionSession
+            this.leftAt = Date.now()
+        }
+        this.missionSession = undefined
+    }
+
+    /** Whether an event belongs to the mission just left, sent as the game left it. */
+    lateFromLeft(session) {
+        return session.Id === this.left && Date.now() - this.leftAt < LATE_EVENTS
+    }
+
+    menu() {
+        this.leave()
+        this.set("In Menu")
+    }
+
+    planning(contractId, gameVersion) {
+        const contract = this.controller.resolveContract(contractId, gameVersion)
+        if (!contract) return
+        this.leave()
+        this.set(line(["Planning", ...describeContract(this.controller, contract, gameVersion)]))
+    }
+
+    /** Any event of a contract session: the player is in that mission, however they got there. */
+    event(session, gameVersion) {
+        if (!session?.contractId || session.Id === this.missionSession || this.lateFromLeft(session)) return
+        const contract = this.controller.resolveContract(session.contractId, gameVersion)
+        if (!contract) return
+        this.missionSession = session.Id
+        this.set(line([...describeContract(this.controller, contract, gameVersion), DIFFICULTIES[session.difficulty]]))
+    }
+
+    debrief() {
+        this.leave()
+        this.set("In Menu · Mission debrief")
+    }
+
+    /** The menu page the game opened, by its route under /profiles/page. Pages a mission's pause menu opens change nothing. */
+    page(path, query, gameVersion) {
+        switch (path.toLowerCase()) {
+            case "/hub":
+            case "/destination":
+                this.menu()
+                break
+            case "/planning":
+                if (query.contractid) this.planning(query.contractid, gameVersion)
+                break
+            case "/missionend":
+            case "/missionendready":
+                this.debrief()
+                break
+            default:
+                break
+        }
+    }
+
+    /** Starts following the game: menu pages through the router in front of Peacock's, missions through its events. */
+    follow() {
+        multiplayerMenuDataRouter.use((req, res, next) => {
+            try {
+                if (req.method === "GET") this.page(req.path, req.query, req.gameVersion)
+            } catch (e) {
+                log(LogLevel.DEBUG, `Presence: ${e?.message ?? e}`, "stoker")
+            }
+            next()
+        })
+
+        this.controller.hooks.newEvent.tap("StokerPresence", (event, details, session) => {
+            try {
+                this.event(session, details?.gameVersion ?? session?.gameVersion)
+            } catch (e) {
+                log(LogLevel.DEBUG, `Presence: ${e?.message ?? e}`, "stoker")
+            }
+        })
+
+        this.menu()
+    }
+}
+
+/** The presence this run sends, once the launcher takes it; withdrawn when the game exits. */
+let presence
+
+module.exports = async function stokerPlugin(controller) {
     SteamStrategy.prototype.get = async function stokerEntitlements() {
         const ents = entitlements()
         log(
@@ -349,6 +686,25 @@ module.exports = async function stokerPlugin() {
         "stoker",
     )
 
-    await useStokerLeaderboards()
+    serveDebriefingLeaderboard()
+
+    const launcher = await connectToLauncher()
+    if (!launcher) {
+        releaseLeaderboards()
+        log(LogLevel.INFO, "Not part of a game the Stoker launcher started; the leaderboards are Peacock's own.", "stoker")
+    } else {
+        if (launcher.capability("leaderboards") >= 1) {
+            agent = launcher
+            useStokerLeaderboards(controller)
+        } else {
+            releaseLeaderboards()
+        }
+
+        if (launcher.capability("presence") >= 1) {
+            presence = new Presence(controller, launcher)
+            presence.follow()
+        }
+    }
+
     exitWithGame()
 }

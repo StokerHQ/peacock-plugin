@@ -19,9 +19,9 @@ STOKER_PLUGIN_MANIFEST(R"json({
   "id": "app.stokerhq.peacock",
   "name": "Peacock (HITMAN World of Assassination)",
   "type": "hook",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "abi": 1,
-  "description": "Starts the Peacock release laid into the install, with Stoker's Peacock plugin, and points HITMAN World of Assassination at it, as PeacockPatcher does: certificate pinning off, the auth header always sent, the server's address, plain HTTP, dynamic resources. Peacock replaces IOI's online services; Stoker supplies the player and their DLC.",
+  "description": "Starts the Peacock release laid into the install, with Stoker's Peacock plugin, and points HITMAN World of Assassination at it, as PeacockPatcher does: certificate pinning off, the auth header always sent, the server's address, plain HTTP, dynamic resources. Peacock replaces IOI's online services; Stoker supplies the player and their DLC, and gets the leaderboards and what the player is doing - menu, mission, mode - for their friends.",
   "hosts": ["steamworks"],
   "config": {
     "type": "object", "additionalProperties": false,
